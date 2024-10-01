@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,65 +14,81 @@ import (
 	"gateway/internal/pkg/balancer"
 
 	"github.com/gorilla/mux"
+	"github.com/sirupsen/logrus"
 )
 
+// UpstreamServices структура для хранения балансировщиков upstream сервисов.
 type UpstreamServices struct {
 	IdentityService *balancer.Balancer
+}
+
+// init настраивает logrus.
+func init() {
+	logrus.SetOutput(os.Stdout)
 }
 
 // Run запускает HTTP сервер и обрабатывает сигналы для корректного завершения работы.
 func Run(cfg config.Config) {
 	upstreamServices, err := newUpstreamServices(cfg.IdentityServiceAddresses)
 	if err != nil {
-		log.Fatalf("Ошибка разбора URL upstream сервисов: %v", err)
+		logrus.WithError(err).Fatal("Не удалось инициализировать upstream сервисы")
 	}
 
 	router := mux.NewRouter()
 	safeProxyRequestWithSecret := safeProxyRequest([]byte(cfg.Secret))
 
-	// Маршрутизация запросов
-	router.PathPrefix("/auth/token").HandlerFunc(wrapHandler(upstreamServices.IdentityService, authTokenHandler)).Methods("POST")
-	router.PathPrefix("/auth/").HandlerFunc(wrapHandler(upstreamServices.IdentityService, proxyRequest))
-	// Во всех остальных ручках проверяется JWT
-	router.PathPrefix("/users/").HandlerFunc(wrapHandler(upstreamServices.IdentityService, safeProxyRequestWithSecret))
+	router.PathPrefix("/auth/token").HandlerFunc(wrapHandler(upstreamServices.IdentityService, authTokenHandler, "authTokenHandler")).Methods("POST")
+	router.PathPrefix("/auth/").HandlerFunc(wrapHandler(upstreamServices.IdentityService, proxyRequest, "proxyRequest"))
+	router.PathPrefix("/users/").HandlerFunc(wrapHandler(upstreamServices.IdentityService, safeProxyRequestWithSecret, "safeProxyRequestWithSecret"))
 
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.HTTP.Port),
 		Handler: router,
 	}
 
-	// Запуск сервера в отдельной горутине
 	go func() {
-		log.Printf("Запуск сервера на порту %d", cfg.HTTP.Port)
+		logrus.Infof("Запуск сервера на порту %d", cfg.HTTP.Port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Ошибка запуска сервера: %s", err)
+			logrus.WithError(err).Fatal("Ошибка запуска сервера")
 		}
 	}()
 
-	// Ожидание сигналов завершения работы
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	log.Println("Завершение работы сервера...")
+	logrus.Info("Завершение работы сервера...")
 
-	// Контекст для завершения сервера с таймаутом 5 секунд
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("Принудительное завершение работы сервера: %s", err)
+		logrus.WithError(err).Fatal("Принудительное завершение работы сервера")
 	}
 
-	log.Println("Сервер завершил работу")
+	logrus.Info("Сервер завершил работу")
 }
 
-// wrapHandler оборачивает хендлер с логикой балансировки.
-func wrapHandler(balancer *balancer.Balancer, handler func(http.ResponseWriter, *http.Request, *url.URL) error) http.HandlerFunc {
+// wrapHandler оборачивает хендлер с логикой балансировки и логированием.
+func wrapHandler(balancer *balancer.Balancer, handler func(http.ResponseWriter, *http.Request, *url.URL) error, handlerName string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		upstream := balancer.Next()
 		if upstream == nil {
+			logrus.Error("Нет доступных upstream сервисов")
 			http.Error(w, "Нет доступных upstream сервисов", http.StatusServiceUnavailable)
 			return
 		}
-		handler(w, r, upstream)
+
+		requestLogger := logrus.WithFields(logrus.Fields{
+			"upstream":    upstream.String(),
+			"method":      r.Method,
+			"path":        r.URL.Path,
+			"handlerName": handlerName,
+		})
+
+		requestLogger.Info("Перенаправление запроса на upstream")
+
+		err := handler(w, r, upstream)
+		if err != nil {
+			requestLogger.WithError(err).Error("Ошибка обработки запроса")
+		}
 	}
 }
